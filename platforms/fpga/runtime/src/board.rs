@@ -725,8 +725,10 @@ pub unsafe fn main() {
             "[mcu-runtime] Active I3C core for MCTP: {}",
             MCU_STRAPS.active_i3c
         );
+        // This platform's I3C controller takes the private-read length from the IBI.
         caliptra_mcu_components::mux_mctp::MCTPMuxComponent::new(active_i3c_core, mux_alarm)
             .with_uuid(mctp_endpoint_uuid)
+            .with_pending_read_len_bytes(2)
             .finalize(mctp_mux_component_static!(InternalTimers, MCTPI3CBinding))
     };
     #[cfg(any(

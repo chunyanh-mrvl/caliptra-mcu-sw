@@ -17,6 +17,9 @@ pub const MCTP_I3C_MAXMTU: usize = MCTP_I3C_MAXBUF - 1;
 pub const MCTP_I3C_MINMTU: usize = MCTP_HDR_SIZE + MCTP_BASELINE_TRANSMISSION_UNIT;
 pub const MCTP_I3C_MIN_PACKET_SIZE: usize = MCTP_I3C_MINMTU + 1;
 
+/// Mandatory Data Byte of the pending-read IBI.
+pub const MCTP_PENDING_READ_MDB: u8 = 0xAE;
+
 /// This trait contains the interface definition
 /// for sending the MCTP packet through MCTP transport binding layer.
 pub trait MCTPTransportBinding<'a> {
@@ -71,6 +74,9 @@ pub struct MCTPI3CBinding<'a> {
     max_read_len: Cell<usize>,
     /// Max Write length supported by the I3C target device.
     max_write_len: Cell<usize>,
+    /// Number of big-endian response-length bytes appended after the MDB in
+    /// the pending-read IBI.
+    pending_read_len_bytes: Cell<usize>,
     /// Buffer to store the transmitted packet.
     tx_buffer: TakeCell<'static, [u8]>,
 }
@@ -84,8 +90,20 @@ impl<'a> MCTPI3CBinding<'a> {
             device_address: Cell::new(0),
             max_read_len: Cell::new(0),
             max_write_len: Cell::new(0),
+            pending_read_len_bytes: Cell::new(0),
             tx_buffer: TakeCell::empty(),
         }
+    }
+
+    /// Sets how many bytes of the response length (big-endian) follow the MDB
+    /// in the pending-read IBI.
+    ///
+    /// 0 (default) sends the MDB only: the controller reads up to MRL and the
+    /// target ends the transfer on the T-bit. A non-zero value is for
+    /// controllers that must know the private-read length in advance.
+    pub fn set_pending_read_len_bytes(&self, len_bytes: usize) {
+        assert!(len_bytes <= core::mem::size_of::<u32>());
+        self.pending_read_len_bytes.set(len_bytes);
     }
 
     pub fn setup_mctp_i3c(&self) {
@@ -141,6 +159,20 @@ impl<'a> MCTPTransportBinding<'a> for MCTPI3CBinding<'a> {
             Err((ErrorCode::SIZE, self.tx_buffer.take().unwrap()))?;
         }
 
+        // The controller reads the packet plus the PEC byte.
+        let read_len = len + 1;
+        let read_len_be = (read_len as u32).to_be_bytes();
+        let len_bytes = self.pending_read_len_bytes.get();
+        if len_bytes > 0 && len_bytes < read_len_be.len() && (read_len >> (8 * len_bytes)) != 0 {
+            capsule_debug!(
+                "MCTP-I3C",
+                "Read length {} does not fit in {} IBI byte(s)",
+                read_len,
+                len_bytes
+            );
+            Err((ErrorCode::SIZE, self.tx_buffer.take().unwrap()))?;
+        }
+
         // Tx is a read operation from the I3C controller. Set the R/W bit at LSB to 1.
         let addr = (self.device_address.get() << 1) | 0x01;
         match self.tx_buffer.take() {
@@ -149,8 +181,17 @@ impl<'a> MCTPTransportBinding<'a> for MCTPI3CBinding<'a> {
                     let pec = MCTPI3CBinding::compute_pec(addr, tx_buffer, len);
                     tx_buffer[len] = pec;
 
-                    match self.i3c_target.transmit_read(tx_buffer, len + 1) {
-                        Ok(_) => {}
+                    match self.i3c_target.transmit_read(tx_buffer, read_len) {
+                        Ok(_) => {
+                            // transmit_read() only succeeds when no IBI is
+                            // outstanding, so this cannot report BUSY.
+                            let payload = &read_len_be[read_len_be.len() - len_bytes..];
+                            if let Err(_e) =
+                                self.i3c_target.send_ibi(MCTP_PENDING_READ_MDB, payload)
+                            {
+                                capsule_debug!("MCTP-I3C", "Pending-read IBI failed: {:?}", _e);
+                            }
+                        }
                         Err((e, tx_buffer)) => {
                             Err((e, tx_buffer))?;
                         }
@@ -248,6 +289,9 @@ mod tests {
             len: usize,
         ) -> Result<(), (ErrorCode, &'static mut [u8])> {
             self.wire_len.set(len);
+            Ok(())
+        }
+        fn send_ibi(&self, _mdb: u8, _payload: &[u8]) -> Result<(), ErrorCode> {
             Ok(())
         }
         fn enable(&self) {}
@@ -358,5 +402,110 @@ mod tests {
             MCTPI3CBinding::compute_pec(dev_addr, &pkt[1..pkt_buf_len], pkt_buf_len - 1);
         let exp_pec = calculate_crc8(&pkt[..pkt_buf_len]);
         assert_eq!(exp_pec, computed_pec);
+    }
+
+    use caliptra_mcu_i3c_driver::hil::I3CTargetInfo;
+
+    const STATIC_ADDR: u8 = 0x3a;
+
+    /// Records what the binding hands to the I3C target.
+    struct FakeTarget {
+        read_len: Cell<usize>,
+        ibi: Cell<Option<(u8, [u8; 4], usize)>>,
+    }
+
+    impl FakeTarget {
+        fn new() -> Self {
+            Self {
+                read_len: Cell::new(0),
+                ibi: Cell::new(None),
+            }
+        }
+
+        fn ibi_payload(&self) -> (u8, Vec<u8>) {
+            let (mdb, payload, len) = self.ibi.get().expect("no IBI sent");
+            (mdb, payload[..len].to_vec())
+        }
+    }
+
+    impl<'a> I3CTarget<'a> for FakeTarget {
+        fn set_tx_client(&self, _client: &'a dyn TxClient) {}
+        fn set_rx_client(&self, _client: &'a dyn RxClient) {}
+        fn set_rx_buffer(&self, _rx_buf: &'static mut [u8]) {}
+        fn transmit_read(
+            &self,
+            _tx_buf: &'static mut [u8],
+            len: usize,
+        ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+            self.read_len.set(len);
+            Ok(())
+        }
+        fn send_ibi(&self, mdb: u8, payload: &[u8]) -> Result<(), ErrorCode> {
+            let mut saved = [0u8; 4];
+            saved[..payload.len()].copy_from_slice(payload);
+            self.ibi.set(Some((mdb, saved, payload.len())));
+            Ok(())
+        }
+        fn enable(&self) {}
+        fn disable(&self) {}
+        fn get_device_info(&self) -> I3CTargetInfo {
+            I3CTargetInfo {
+                static_addr: Some(STATIC_ADDR),
+                dynamic_addr: None,
+                max_read_len: MCTP_I3C_MAXBUF,
+                max_write_len: MCTP_I3C_MAXBUF,
+            }
+        }
+    }
+
+    fn packet(len: usize) -> &'static mut [u8] {
+        let buf = Box::leak(Box::new([0u8; MCTP_I3C_MAXBUF]));
+        for (i, b) in buf[..len].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        buf
+    }
+
+    #[test]
+    fn pending_read_ibi_is_mdb_only_by_default() {
+        let target = FakeTarget::new();
+        let binding = MCTPI3CBinding::new(&target);
+        binding.setup_mctp_i3c();
+
+        binding.transmit(packet(10), 10).unwrap();
+
+        assert_eq!(target.read_len.get(), 11);
+        assert_eq!(target.ibi_payload(), (MCTP_PENDING_READ_MDB, vec![]));
+    }
+
+    #[test]
+    fn pending_read_ibi_appends_big_endian_read_length() {
+        let target = FakeTarget::new();
+        let binding = MCTPI3CBinding::new(&target);
+        binding.setup_mctp_i3c();
+        binding.set_pending_read_len_bytes(2);
+
+        binding.transmit(packet(255), 255).unwrap();
+
+        // read length includes the PEC byte: 256 = 0x0100, MSB first
+        assert_eq!(
+            target.ibi_payload(),
+            (MCTP_PENDING_READ_MDB, vec![0x01, 0x00])
+        );
+    }
+
+    #[test]
+    fn pending_read_ibi_rejects_length_that_does_not_fit() {
+        let target = FakeTarget::new();
+        let binding = MCTPI3CBinding::new(&target);
+        binding.setup_mctp_i3c();
+        binding.set_pending_read_len_bytes(1);
+
+        // 255 bytes + PEC = 256 does not fit in one byte
+        let (err, _) = binding.transmit(packet(255), 255).unwrap_err();
+
+        assert_eq!(err, ErrorCode::SIZE);
+        assert_eq!(target.read_len.get(), 0);
+        assert!(target.ibi.get().is_none());
     }
 }

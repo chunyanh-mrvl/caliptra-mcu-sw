@@ -107,6 +107,28 @@ impl Registers {
 
 type Driver = I3CCore<'static, TestAlarm>;
 
+const TEST_MDB: u8 = 0xae;
+
+// Stands in for a client that announces each queued response with an IBI
+// carrying the 2-byte big-endian length, so the IBI port is left holding one
+// payload word after the descriptor.
+fn transmit(
+    driver: &Driver,
+    buf: &'static mut [u8],
+    len: usize,
+) -> Result<(), (ErrorCode, &'static mut [u8])> {
+    driver.transmit_read(buf, len)?;
+    driver
+        .send_ibi(TEST_MDB, &(len as u16).to_be_bytes())
+        .unwrap();
+    Ok(())
+}
+
+fn pending(len: u16) -> Option<(u8, [u8; MAX_IBI_PAYLOAD_LEN], usize)> {
+    let [hi, lo] = len.to_be_bytes();
+    Some((TEST_MDB, [hi, lo, 0, 0], 2))
+}
+
 struct TxRecorder {
     driver: &'static Driver,
     calls: Cell<usize>,
@@ -120,7 +142,7 @@ impl TxClient for TxRecorder {
         self.calls.set(self.calls.get() + 1);
         self.buffer.replace(buffer);
         if let Some(next) = self.next.take() {
-            self.driver.transmit_read(next, 4).unwrap();
+            transmit(self.driver, next, 4).unwrap();
         }
     }
 }
@@ -262,7 +284,7 @@ fn tx_bounds_and_word_padding() {
         for (i, byte) in buf.iter_mut().enumerate() {
             *byte = i as u8;
         }
-        let result = h.driver.transmit_read(buf, len);
+        let result = transmit(h.driver, buf, len);
         if valid {
             assert!(result.is_ok());
             assert_eq!(h.registers.port(0x278).get(), len as u32);
@@ -295,7 +317,7 @@ fn tx_busy_until_deferred_completion_and_callback_can_send_next() {
     let h = Harness::new();
     let first = buffer(4);
     let first_ptr = first.as_ptr();
-    h.driver.transmit_read(first, 4).unwrap();
+    transmit(h.driver, first, 4).unwrap();
     let second = buffer(4);
     let second_ptr = second.as_ptr();
     for acked in [false, true] {
@@ -304,20 +326,20 @@ fn tx_busy_until_deferred_completion_and_callback_can_send_next() {
         }
         let busy = buffer(4);
         let busy_ptr = busy.as_ptr();
-        let (error, returned) = h.driver.transmit_read(busy, 4).unwrap_err();
+        let (error, returned) = transmit(h.driver, busy, 4).unwrap_err();
         assert_eq!(error, ErrorCode::BUSY);
         assert_eq!(returned.as_ptr(), busy_ptr);
         assert_eq!(h.tx.calls.get(), 0);
     }
     assert!(!DeferredCall::has_tasks());
-    let (error, _) = h.driver.transmit_read(buffer(0), 0).unwrap_err();
+    let (error, _) = transmit(h.driver, buffer(0), 0).unwrap_err();
     assert_eq!(error, ErrorCode::BUSY);
     h.private_read_done();
     h.tx.next.replace(second);
     assert!(DeferredCall::service_next_pending().is_some());
     assert_eq!(h.tx.calls.get(), 1);
     assert_eq!(h.tx.buffer.take().unwrap().as_ptr(), first_ptr);
-    assert_eq!(h.driver.pending_ibi.get(), Some((MDB_PENDING_READ_MCTP, 4)));
+    assert_eq!(h.driver.pending_ibi.get(), pending(4));
     h.complete_tx();
     assert_eq!(h.tx.calls.get(), 2);
     assert_eq!(h.tx.buffer.take().unwrap().as_ptr(), second_ptr);
@@ -328,7 +350,7 @@ fn private_read_before_ibi_keeps_buffer_until_both_complete() {
     let h = Harness::new();
     let buf = buffer(4);
     let ptr = buf.as_ptr();
-    h.driver.transmit_read(buf, 4).unwrap();
+    transmit(h.driver, buf, 4).unwrap();
     h.private_read_done();
     assert!(!DeferredCall::has_tasks());
     assert_eq!(h.tx.calls.get(), 0);
@@ -349,10 +371,10 @@ fn configured_read_and_write_limits_are_enforced() {
     assert_eq!(info.max_write_len, 3);
     let tx = buffer(5);
     let ptr = tx.as_ptr();
-    let (error, tx) = h.driver.transmit_read(tx, 5).unwrap_err();
+    let (error, tx) = transmit(h.driver, tx, 5).unwrap_err();
     assert_eq!(error, ErrorCode::SIZE);
     assert_eq!(tx.as_ptr(), ptr);
-    h.driver.transmit_read(tx, 4).unwrap();
+    transmit(h.driver, tx, 4).unwrap();
     h.complete_tx();
     assert_eq!(h.tx.buffer.take().unwrap().as_ptr(), ptr);
     h.driver.set_rx_buffer(buffer(8));
@@ -370,17 +392,17 @@ fn failed_ibi_resends_without_completing_or_releasing_buffer() {
     let h = Harness::new();
     let buf = buffer(5);
     let ptr = buf.as_ptr();
-    h.driver.transmit_read(buf, 5).unwrap();
+    transmit(h.driver, buf, 5).unwrap();
     for status in 1..=4 {
         h.registers.port(0x280).set(0);
         h.ibi_done(status);
         assert_eq!(h.registers.port(0x280).get(), 5u16.swap_bytes() as u32);
-        assert_eq!(h.driver.pending_ibi.get(), Some((MDB_PENDING_READ_MCTP, 5)));
+        assert_eq!(h.driver.pending_ibi.get(), pending(5));
         assert_eq!(h.tx.calls.get(), 0);
         assert!(!DeferredCall::has_tasks());
         let busy = buffer(4);
         let busy_ptr = busy.as_ptr();
-        let (error, returned) = h.driver.transmit_read(busy, 4).unwrap_err();
+        let (error, returned) = transmit(h.driver, busy, 4).unwrap_err();
         assert_eq!(error, ErrorCode::BUSY);
         assert_eq!(returned.as_ptr(), busy_ptr);
     }
@@ -390,12 +412,56 @@ fn failed_ibi_resends_without_completing_or_releasing_buffer() {
 }
 
 #[test]
+fn transmit_read_leaves_ibi_to_the_caller() {
+    let h = Harness::new();
+    h.driver.transmit_read(buffer(4), 4).unwrap();
+    assert_eq!(h.registers.port(0x280).get(), 0);
+    assert!(h.driver.pending_ibi.is_none());
+}
+
+#[test]
+fn send_ibi_writes_mdb_and_payload() {
+    let h = Harness::new();
+    h.driver.send_ibi(TEST_MDB, &[]).unwrap();
+    assert_eq!(
+        h.registers.port(0x280).get(),
+        (IbiDescriptor::Mdb.val(TEST_MDB as u32) + IbiDescriptor::DataLength.val(0)).value
+    );
+    assert_eq!(
+        h.driver.pending_ibi.get(),
+        Some((TEST_MDB, [0; MAX_IBI_PAYLOAD_LEN], 0))
+    );
+    h.ibi_done(0);
+    assert!(h.driver.pending_ibi.is_none());
+
+    h.driver.send_ibi(TEST_MDB, &[0x12, 0x34, 0x56]).unwrap();
+    // The payload word follows the descriptor; payload[0] is sent first.
+    assert_eq!(h.registers.port(0x280).get(), 0x0056_3412);
+    assert_eq!(
+        h.driver.pending_ibi.get(),
+        Some((TEST_MDB, [0x12, 0x34, 0x56, 0], 3))
+    );
+}
+
+#[test]
+fn send_ibi_rejects_oversized_payload_and_outstanding_ibi() {
+    let h = Harness::new();
+    assert_eq!(
+        h.driver.send_ibi(TEST_MDB, &[0; MAX_IBI_PAYLOAD_LEN + 1]),
+        Err(ErrorCode::SIZE)
+    );
+    assert!(h.driver.pending_ibi.is_none());
+    h.driver.send_ibi(TEST_MDB, &[]).unwrap();
+    assert_eq!(h.driver.send_ibi(TEST_MDB, &[]), Err(ErrorCode::BUSY));
+}
+
+#[test]
 fn spurious_ibi_does_not_complete_twice() {
     let h = Harness::new();
     h.ibi_done(0);
     assert!(!DeferredCall::has_tasks());
     assert_eq!(h.registers.port(0x280).get(), 0);
-    h.driver.transmit_read(buffer(4), 4).unwrap();
+    transmit(h.driver, buffer(4), 4).unwrap();
     // An empty interrupt must not release a still-pending IBI.
     h.driver.handle_interrupt();
     assert_eq!(h.tx.calls.get(), 0);
@@ -488,7 +554,7 @@ fn zero_length_rx_keeps_buffer_and_empty_tx_retries() {
     h.alarm.fire();
     assert!(h.driver.retry_outgoing_read.get());
     assert!(h.alarm.is_armed());
-    h.driver.transmit_read(buffer(4), 4).unwrap();
+    transmit(h.driver, buffer(4), 4).unwrap();
     assert!(!h.driver.retry_outgoing_read.get());
     h.complete_tx();
 }

@@ -48,11 +48,19 @@ pub trait I3CTarget<'a> {
     /// Returns `SIZE` with the original buffer if `len` exceeds the buffer or
     /// `get_device_info().max_read_len`, or is zero. An outstanding transfer
     /// takes precedence and returns `BUSY`.
+    /// The caller is responsible for telling the controller that data is
+    /// pending, e.g. with `send_ibi`.
     fn transmit_read(
         &self,
         tx_buf: &'static mut [u8],
         len: usize,
     ) -> Result<(), (ErrorCode, &'static mut [u8])>;
+
+    /// Raise an In-Band Interrupt carrying `mdb` followed by `payload`.
+    /// The driver retries the IBI until the controller accepts it.
+    /// Returns `BUSY` if an IBI is already outstanding, or `SIZE` if `payload`
+    /// is longer than the driver supports.
+    fn send_ibi(&self, mdb: u8, payload: &[u8]) -> Result<(), ErrorCode>;
 
     /// Enable the I3C target device
     fn enable(&self);

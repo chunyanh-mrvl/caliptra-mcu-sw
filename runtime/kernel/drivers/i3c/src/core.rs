@@ -18,7 +18,8 @@ use kernel::utilities::StaticRef;
 use kernel::ErrorCode;
 use tock_registers::{register_bitfields, LocalRegisterCopy};
 
-pub const MDB_PENDING_READ_MCTP: u8 = 0xae;
+/// Largest IBI payload (bytes after the MDB) accepted by `send_ibi`.
+pub const MAX_IBI_PAYLOAD_LEN: usize = 4;
 /// TTI RX and TX data FIFO capacity: 64 DWORD entries.
 pub const MAX_READ_WRITE_SIZE: usize = 256;
 #[cfg(target_arch = "riscv32")]
@@ -53,7 +54,8 @@ pub struct I3CCore<'a, A: Alarm<'a>> {
     alarm: VirtualMuxAlarm<'a, A>,
     retry_outgoing_read: Cell<bool>,
     retry_incoming_write: Cell<bool>,
-    pending_ibi: OptionalCell<(u8, u16)>,
+    // outstanding IBI kept for retries: (MDB, payload buffer, payload length)
+    pending_ibi: OptionalCell<(u8, [u8; MAX_IBI_PAYLOAD_LEN], usize)>,
     tx_desc_complete: Cell<bool>,
     max_read_len: Cell<usize>,
     max_write_len: Cell<usize>,
@@ -260,32 +262,35 @@ impl<'a, A: Alarm<'a>> I3CCore<'a, A> {
         }
     }
 
-    fn send_ibi(&self, mdb: u8, len: u16) {
-        if self.pending_ibi.is_some() {
-            // we can only have one IBI pending at a time
-            return;
-        }
+    fn write_ibi(&self, mdb: u8, payload: &[u8]) {
         // write the descriptor first
-        self.registers
-            .tti_tti_ibi_port
-            .set((IbiDescriptor::Mdb.val(mdb as u32) + IbiDescriptor::DataLength.val(2)).into());
-
-        // Note: we only write 2 bytes so that the IBI is <=4 bytes long so that
-        // the controller can read it in one dword.
-        self.registers.tti_tti_ibi_port.set(len.swap_bytes() as u32);
-        self.pending_ibi.set((mdb, len));
+        self.registers.tti_tti_ibi_port.set(
+            (IbiDescriptor::Mdb.val(mdb as u32)
+                + IbiDescriptor::DataLength.val(payload.len() as u32))
+            .into(),
+        );
+        // The TTI sends the payload starting from the least significant byte of
+        // each word, so payload[0] is the first byte on the bus after the MDB.
+        for chunk in payload.chunks(4) {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.registers
+                .tti_tti_ibi_port
+                .set(u32::from_le_bytes(word));
+        }
     }
 
     fn ibi_done(&self, ibi_status: u32) {
-        if let Some((mdb, len)) = self.pending_ibi.take() {
+        if let Some((mdb, payload, payload_len)) = self.pending_ibi.get() {
             // check if IBI was successful
             if ibi_status == 0 {
+                self.pending_ibi.clear();
                 self.try_complete_tx();
                 // schedule a callback to handle any pending private reads
                 self.set_alarm(Self::RETRY_WAIT_TICKS);
             } else {
                 // re-send IBI
-                self.send_ibi(mdb, len);
+                self.write_ibi(mdb, &payload[..payload_len]);
             }
         }
     }
@@ -321,11 +326,24 @@ impl<'a, A: Alarm<'a>> crate::hil::I3CTarget<'a> for I3CCore<'a, A> {
         self.tx_buffer.replace(tx_buf);
         self.tx_buffer_idx.set(0);
         self.tx_buffer_size.set(len);
-        // TODO: check that this is for MCTP or something else
-        // immediately send the read to the I3C target interface and send an IBI so the controller knows we have data
+        // immediately send the read to the I3C target interface; the client
+        // announces it to the controller with send_ibi()
         self.handle_outgoing_read();
-        // send the length as part of the IBI
-        self.send_ibi(MDB_PENDING_READ_MCTP, len as u16);
+        Ok(())
+    }
+
+    fn send_ibi(&self, mdb: u8, payload: &[u8]) -> Result<(), ErrorCode> {
+        if self.pending_ibi.is_some() {
+            // we can only have one IBI pending at a time
+            return Err(ErrorCode::BUSY);
+        }
+        if payload.len() > MAX_IBI_PAYLOAD_LEN {
+            return Err(ErrorCode::SIZE);
+        }
+        let mut saved = [0u8; MAX_IBI_PAYLOAD_LEN];
+        saved[..payload.len()].copy_from_slice(payload);
+        self.pending_ibi.set((mdb, saved, payload.len()));
+        self.write_ibi(mdb, payload);
         Ok(())
     }
 
